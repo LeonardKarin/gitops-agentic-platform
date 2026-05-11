@@ -216,6 +216,3 @@ This threshold aligns with industry standard "High" severity classification. In 
 MIT License — see [LICENSE](LICENSE) for details.
 
 ---
-
-*Built by a Principal Engineer who operates production infrastructure at scale  
-and believes that AI agents in production require the same rigor as any other production system.*
