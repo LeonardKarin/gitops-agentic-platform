@@ -1,0 +1,157 @@
+## @file        .editorconfig
+## @brief       Editor configuration for the gitops-agentic-platform shared layer and all consuming repos
+## @details     Enforces UTF-8 encoding, Unix LF line endings, and per-language indentation
+##              rules derived from the project coding standards defined in SKILL-global.md.
+##              Picked up automatically by VS Code, JetBrains IDEs, Vim (with plugin),
+##              Emacs (with plugin), and the GitLab Web IDE.
+##              Reference: https://editorconfig.org/
+## @author      Platform Engineering
+## @project     gitops-agentic-platform
+## @note        Classification: INTERNAL
+
+### S-GLCR ###
+### E-GLCR ###
+
+# ── root declaration ──────────────────────────────────────────────────────────
+# Stop editor from searching for .editorconfig files in parent directories.
+# This file is authoritative for the entire repository tree.
+root = true
+
+# ── global defaults ───────────────────────────────────────────────────────────
+# Applies to every file not matched by a more specific section below.
+# Establishes the non-negotiable baseline: UTF-8, Unix LF, final newline,
+# no trailing whitespace. These mirror the hard rules in SKILL-global.md §1.
+[*]
+charset                  = utf-8
+end_of_line              = lf
+insert_final_newline     = true
+trim_trailing_whitespace = true
+indent_style             = tab
+indent_size              = 4
+max_line_length          = 99
+
+# ── Python (.py) ──────────────────────────────────────────────────────────────
+# PEP 8 mandates spaces, not tabs. 4-space indentation.
+# max_line_length = 99 matches the project convention (PEP 8 default is 79;
+# project uses 99 for readability — docstrings and comments remain at 79).
+# Reference: SKILL-python.md §3, https://peps.python.org/pep-0008/
+[*.py]
+indent_style             = space
+indent_size              = 4
+max_line_length          = 99
+
+# ── Bash / Shell (.sh) ────────────────────────────────────────────────────────
+# GNU Bash standard: tabs for indentation, 4-space equivalent width.
+# Reference: SKILL-bash.md §2, https://www.gnu.org/software/bash/manual/bash.html
+[*.sh]
+indent_style             = tab
+indent_size              = 4
+max_line_length          = 99
+
+# ── YAML / Ansible (.yml, .yaml) ─────────────────────────────────────────────
+# YAML 1.2.2 spec forbids tab characters in indentation — spaces only.
+# 2-space indentation is the Ansible community standard and matches the
+# project campaign playbook structure defined in SKILL-ansible.md §2.
+# Reference: SKILL-ansible.md §2, https://yaml.org/spec/1.2.2/
+[*.yml]
+indent_style             = space
+indent_size              = 2
+max_line_length          = 160
+
+[*.yaml]
+indent_style             = space
+indent_size              = 2
+max_line_length          = 160
+
+# ── Jinja2 templates (.j2) ───────────────────────────────────────────────────
+# Jinja2 templates are rendered into YAML, shell, or config files.
+# Follow the indentation of the target format — 2 spaces aligns with YAML targets.
+# Reference: SKILL-ansible.md §8
+[*.j2]
+indent_style             = space
+indent_size              = 2
+max_line_length          = 160
+
+# ── JSON (.json) ─────────────────────────────────────────────────────────────
+# Aggregator outputs, Rundeck dropdown sources, NetBox API payloads.
+# 2-space indentation matches jq and python json.dumps(indent=2) convention.
+# rd_*.json and per_*.json are auto-generated — .editorconfig still applies
+# to any hand-authored JSON (e.g. aggregator/configuration/*.json).
+[*.json]
+indent_style             = space
+indent_size              = 2
+max_line_length          = off
+
+# ── Markdown (.md) ───────────────────────────────────────────────────────────
+# SKILL files, agent definitions, CLAUDE.md, README.md.
+# Trailing whitespace trimming is disabled for Markdown: two trailing spaces
+# produce a <br> line break in standard Markdown renderers — trimming would
+# silently break intentional hard line breaks.
+# 2-space indentation for nested lists per CommonMark spec.
+[*.md]
+indent_style             = space
+indent_size              = 2
+max_line_length          = off
+trim_trailing_whitespace = false
+
+# ── INI / EditorConfig (.ini, .editorconfig) ─────────────────────────────────
+# Configuration files using INI-style syntax.
+# Tabs preserved — many INI parsers are tab-tolerant but spaces are safer.
+[*.ini]
+indent_style             = space
+indent_size              = 4
+
+[.editorconfig]
+indent_style             = space
+indent_size              = 4
+
+# ── Prometheus configuration (.yml handled above) ────────────────────────────
+# prometheus.yml, recording rules, scrape targets — covered by [*.yml] above.
+# .prom textfile_collector outputs are machine-generated — not edited by hand.
+# Listed here for documentation completeness; no override needed.
+# [*.prom] — intentionally omitted: auto-generated, never hand-edited
+
+# ── SQL (.sql) ───────────────────────────────────────────────────────────────
+# Cleansing workflow SQL files (workflow/workflow_standard.wkf sourced SQL).
+# 4-space indentation matches the PostgreSQL community style.
+[*.sql]
+indent_style             = space
+indent_size              = 4
+max_line_length          = 120
+
+# ── Makefile ──────────────────────────────────────────────────────────────────
+# Make requires hard tabs for recipe lines — spaces will break parsing.
+[Makefile]
+indent_style             = tab
+indent_size              = 4
+
+# ── GitLab CI pipeline files ─────────────────────────────────────────────────
+# .github/workflows/ci.yml is YAML — covered by [*.yml] above.
+# Explicit entry here as documentation: CI files are subject to the same
+# 2-space YAML rules and must pass YAML 1.2.2 parse validation in CI.
+[.github/workflows/ci.yml]
+indent_style             = space
+indent_size              = 2
+max_line_length          = 160
+
+# ── Shell library files (no extension) ───────────────────────────────────────
+# shell-lib files (no .sh extension by convention)
+# have no .sh extension by convention. Match them explicitly.
+[{shell-lib}]
+indent_style             = tab
+indent_size              = 4
+max_line_length          = 99
+
+# ── Git files ─────────────────────────────────────────────────────────────────
+[.gitmodules]
+indent_style             = tab
+indent_size              = 4
+
+[.gitignore]
+indent_style             = space
+indent_size              = 4
+trim_trailing_whitespace = true
+
+# ── Cartridge and CI pipe templates ──────────────────────────────────────────
+# indent_style             = tab
+indent_size              = 4

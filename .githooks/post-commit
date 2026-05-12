@@ -1,0 +1,400 @@
+#!/usr/bin/env bash
+## @file        post-commit
+## @brief       Git post-commit hook — reads Claude Code session transcript and writes audit
+## @details     Runs after every git commit outside Claude entirely.
+##              Locates the most recent Claude Code session transcript for this
+##              repository (~/.claude/projects/<hash>/<uuid>.jsonl), extracts all
+##              exchanges that occurred since the previous commit timestamp, and
+##              writes structured audit log entries to .claude/audit/.
+##              Does not depend on Claude being active or the REPL being open.
+##              Activated by bootstrap.sh via: git config core.hooksPath .githooks
+##
+## @author      Platform Engineering
+## @project     gitops-agentic-platform
+## @note        Classification: INTERNAL
+## @warning     The session transcript (~/.claude/projects/) may contain operator
+##              prompts referencing credentials or sensitive data. The hook
+##              sanitizes output — never writes raw credential values to audit logs.
+
+### S-GLCR ###
+### E-GLCR ###
+
+set -euo pipefail
+IFS=$'\n\t'
+
+# ── constants ──────────────────────────────────────────────────────────────────
+readonly AUDIT_DIR=".claude/audit"
+readonly INDEX_FILE="${AUDIT_DIR}/index.json"
+readonly CLAUDE_PROJECTS_DIR="${HOME}/.claude/projects"
+readonly HOOK_NAME="post-commit"
+
+# ── helpers ───────────────────────────────────────────────────────────────────
+
+## @brief   Emit a line to stderr only — hook must not pollute stdout
+_log() { printf '[%s] %s: %s\n' "$(date -u +%FT%TZ)" "${HOOK_NAME}" "$*" >&2; }
+
+## @brief   Derive the Claude Code project hash from the current working directory
+## @details Claude Code converts the repo path to a hash by replacing / with -
+##          and stripping the leading -
+## @return  project hash string (stdout)
+_project_hash() {
+	pwd | sed 's|/|-|g' | sed 's|^-||'
+}
+
+## @brief   Find the most recently modified Claude session transcript for this repo
+## @return  absolute path to the .jsonl file, or empty string if none found
+_latest_transcript() {
+	local _hash
+	_hash="$(_project_hash)"
+	local _project_dir="${CLAUDE_PROJECTS_DIR}/${_hash}"
+
+	if [[ ! -d "${_project_dir}" ]]; then
+		echo ""
+		return 0
+	fi
+
+	# most recently modified .jsonl — that is the active session
+	find "${_project_dir}" -name '*.jsonl' -type f \
+		-printf '%T@ %p\n' 2>/dev/null \
+		| sort -rn \
+		| head -1 \
+		| awk '{print $2}'
+}
+
+## @brief   Get the timestamp of the previous commit (parent of HEAD)
+## @return  ISO 8601 UTC timestamp or epoch 0 if this is the first commit
+_prev_commit_timestamp() {
+	if git rev-parse HEAD~1 &>/dev/null; then
+		git log -1 --pretty=format:'%aI' HEAD~1
+	else
+		echo "1970-01-01T00:00:00Z"
+	fi
+}
+
+## @brief   Resolve or create the current session audit directory
+## @details Uses CLAUDE_SESSION_EPOCH env var if set by the REPL,
+##          otherwise falls back to today's date YYYYMMDD
+_session_dir() {
+	local _epoch="${CLAUDE_SESSION_EPOCH:-$(date -u +%Y%m%d)}"
+	local _dir="${AUDIT_DIR}/session-${_epoch}"
+	mkdir -p "${_dir}"
+	echo "${_dir}"
+}
+
+## @brief   Count existing request logs and return next zero-padded number
+_next_n() {
+	local _dir="${1}"
+	local _count
+	_count=$(find "${_dir}" -name 'request-*.log' 2>/dev/null | wc -l)
+	printf '%03d' "$(( _count + 1 ))"
+}
+
+## @brief   Build a filesystem-safe slug from a string
+_slug() {
+	echo "${1}" \
+		| tr '[:upper:]' '[:lower:]' \
+		| sed 's/[^a-z0-9 ]//g' \
+		| sed 's/ \+/-/g' \
+		| cut -c1-40 \
+		| sed 's/-$//'
+}
+
+## @brief   Detect if this is an automated CI/cartridge commit
+_is_ci_commit() {
+	local _msg="${1}"
+	[[ "${_msg}" =~ ^\[cartridge\] ]] && return 0
+	[[ "${_msg}" =~ ^\[update\ cycle\] ]] && return 0
+	[[ "${GIT_AUTHOR_NAME:-}" == "GitLab CI" ]] && return 0
+	return 1
+}
+
+## @brief   Parse the JSONL transcript and extract exchanges since a given timestamp
+## @details Uses Python3 to parse JSONL, group into user/assistant pairs,
+##          filter by timestamp, extract prompts + tool calls + file writes.
+##          Writes one audit log file per exchange to the session dir.
+## @param[in]  $1  path to .jsonl transcript file
+## @param[in]  $2  ISO 8601 cutoff timestamp — only exchanges after this are written
+## @param[in]  $3  session audit directory
+## @param[in]  $4  commit hash (short)
+_parse_transcript() {
+	local _transcript="${1}"
+	local _since="${2}"
+	local _session_dir="${3}"
+	local _commit_hash="${4}"
+
+	python3 - "${_transcript}" "${_since}" "${_session_dir}" "${_commit_hash}" <<'PY'
+import sys, json, re, os, time
+from datetime import datetime, timezone
+
+transcript_path = sys.argv[1]
+since_str       = sys.argv[2]
+session_dir     = sys.argv[3]
+commit_hash     = sys.argv[4]
+
+# parse cutoff timestamp
+try:
+    since_dt = datetime.fromisoformat(since_str.replace('Z', '+00:00'))
+except Exception:
+    since_dt = datetime.fromtimestamp(0, tz=timezone.utc)
+
+# load all JSONL lines
+entries = []
+with open(transcript_path, 'r', encoding='utf-8', errors='replace') as f:
+    for line in f:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entries.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+
+# group into (user_prompt, assistant_response) pairs with timestamps
+exchanges = []
+i = 0
+while i < len(entries):
+    e = entries[i]
+    ts_str = e.get('timestamp', '')
+    try:
+        ts = datetime.fromisoformat(ts_str.replace('Z', '+00:00'))
+    except Exception:
+        i += 1
+        continue
+
+    # only process exchanges after the cutoff
+    if ts <= since_dt:
+        i += 1
+        continue
+
+    msg = e.get('message', {})
+    role = msg.get('role', e.get('type', ''))
+
+    if role == 'user':
+        # extract user prompt text
+        prompt = ''
+        content = msg.get('content', [])
+        if isinstance(content, str):
+            prompt = content
+        elif isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get('type') == 'text':
+                    prompt += block.get('text', '')
+
+        # look ahead for the assistant response
+        assistant_text = ''
+        tool_calls = []
+        files_written = []
+        j = i + 1
+        while j < len(entries):
+            nxt = entries[j]
+            nxt_msg = nxt.get('message', {})
+            nxt_role = nxt_msg.get('role', nxt.get('type', ''))
+            if nxt_role == 'user':
+                break
+            if nxt_role == 'assistant':
+                nxt_content = nxt_msg.get('content', [])
+                if isinstance(nxt_content, list):
+                    for block in nxt_content:
+                        if not isinstance(block, dict):
+                            continue
+                        if block.get('type') == 'text':
+                            assistant_text += block.get('text', '')
+                        if block.get('type') == 'tool_use':
+                            tool_name = block.get('name', '')
+                            tool_input = block.get('input', {})
+                            tool_calls.append(f"{tool_name}: {json.dumps(tool_input)[:120]}")
+                            # detect file writes
+                            if tool_name in ('Write', 'Edit', 'MultiEdit'):
+                                fp = tool_input.get('file_path') or tool_input.get('path', '')
+                                if fp:
+                                    files_written.append(fp)
+                            # detect bash writes
+                            if tool_name == 'Bash':
+                                cmd = tool_input.get('command', '')
+                                for match in re.findall(r'(?:cat\s*>+|tee\s+)([^\s|&;]+)', cmd):
+                                    files_written.append(match)
+            j += 1
+
+        exchanges.append({
+            'timestamp': ts_str,
+            'prompt': prompt.strip()[:300],
+            'assistant_summary': assistant_text.strip()[:200],
+            'tool_calls': tool_calls,
+            'files_written': files_written,
+        })
+        i = j
+    else:
+        i += 1
+
+if not exchanges:
+    print(f"no new exchanges since {since_str}")
+    sys.exit(0)
+
+# sanitize: redact anything that looks like a credential
+REDACT_PATTERNS = [
+    r'(?i)(password|passwd|token|secret|api.?key|private.?key)\s*[=:]\s*\S+',
+    r'-----BEGIN [A-Z ]+-----',
+    r'[A-Za-z0-9+/]{40,}={0,2}',  # base64 blobs
+]
+
+def sanitize(text):
+    for pat in REDACT_PATTERNS:
+        text = re.sub(pat, '[REDACTED]', text)
+    return text
+
+# determine next request counter
+existing = [f for f in os.listdir(session_dir) if f.startswith('request-')]
+n_start = len(existing) + 1
+
+written = []
+for idx, ex in enumerate(exchanges):
+    n = n_start + idx
+    n_pad = f'{n:03d}'
+    prompt = sanitize(ex['prompt'])
+    slug_raw = re.sub(r'[^a-z0-9 ]', '', prompt.lower())
+    slug = re.sub(r' +', '-', slug_raw).strip('-')[:40]
+    slug = slug or 'exchange'
+
+    # classify type
+    if ex['files_written']:
+        req_type = 'create-or-modify'
+    elif ex['tool_calls']:
+        req_type = 'execute'
+    elif prompt:
+        req_type = 'clarification'
+    else:
+        req_type = 'unknown'
+
+    log_path = os.path.join(session_dir, f'request-{n_pad}-{slug}.log')
+
+    with open(log_path, 'w') as f:
+        f.write(f"REQUEST #{n_pad}\n")
+        f.write(f"timestamp   : {ex['timestamp']}\n")
+        f.write(f"source      : claude-session-transcript (post-commit hook)\n")
+        f.write(f"commit      : {commit_hash}\n")
+        f.write(f"type        : {req_type}\n")
+        f.write(f"classif     : INTERNAL\n")
+        f.write(f"\n")
+        f.write(f"prompt      : \"{prompt}\"\n")
+        f.write(f"\n")
+        f.write(f"assistant   : \"{sanitize(ex['assistant_summary'])}…\"\n")
+        f.write(f"\n")
+        if ex['tool_calls']:
+            f.write(f"tools       :\n")
+            for tc in ex['tool_calls'][:10]:
+                f.write(f"  {sanitize(tc)}\n")
+            f.write(f"\n")
+        if ex['files_written']:
+            f.write(f"files       :\n")
+            for fp in ex['files_written']:
+                f.write(f"  written: {fp} (INTERNAL)\n")
+            f.write(f"\n")
+        f.write(f"compliance  :\n")
+        f.write(f"  source    : claude session transcript — guaranteed by git hook\n")
+        f.write(f"  fedramp   : CM-3 (configuration change control)\n")
+        f.write(f"  sanitized : credential patterns redacted\n")
+
+    # append to session log
+    session_log = os.path.join(session_dir, f"session-{os.path.basename(session_dir).replace('session-','')}.log")
+    with open(session_log, 'a') as f:
+        with open(log_path) as src:
+            f.write(src.read())
+        f.write("\n")
+
+    written.append(log_path)
+    print(f"written: {log_path}")
+
+print(f"total: {len(written)} exchange(s) from transcript")
+PY
+}
+
+## @brief   Update index.json with current session state
+_update_index() {
+	local _session_dir="${1}"
+	local _epoch="${2}"
+	local _author="${3}"
+	local _branch="${4}"
+	local _commit="${5}"
+
+	python3 - "${_session_dir}" "${_epoch}" "${_author}" "${_branch}" "${_commit}" <<'PY'
+import sys, json, os, time
+session_dir, epoch, author, branch, commit = sys.argv[1:]
+index_path = ".claude/audit/index.json"
+index = {}
+if os.path.exists(index_path):
+    try:
+        index = json.load(open(index_path))
+    except Exception:
+        index = {}
+if "sessions" not in index:
+    index = {"schema_version": "1.0", "sessions": []}
+sessions = index["sessions"]
+entry = next((s for s in sessions if s.get("epoch") == epoch), None)
+if not entry:
+    entry = {
+        "epoch": epoch, "operator": author, "branch": branch,
+        "request_count": 0, "commits": [],
+        "log_path": f"{session_dir}/session-{epoch}.log"
+    }
+    sessions.append(entry)
+entry["request_count"] = len([
+    f for f in os.listdir(session_dir) if f.startswith("request-")
+])
+if commit not in entry.get("commits", []):
+    entry.setdefault("commits", []).append(commit)
+entry["last_updated"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+index["last_updated"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+json.dump(index, open(index_path, "w"), indent=2)
+PY
+}
+
+# ── main ──────────────────────────────────────────────────────────────────────
+
+## @brief   Entry point
+main() {
+	[[ -d "${AUDIT_DIR}" ]] || return 0
+
+	# gather commit metadata
+	local _short_hash _author _branch _message
+	_short_hash="$(git rev-parse --short HEAD)"
+	_author="$(git log -1 --pretty=format:'%an')"
+	_branch="$(git branch --show-current 2>/dev/null || echo 'detached')"
+	_message="$(git log -1 --pretty=format:'%s')"
+
+	# CI commits — log minimal entry and exit
+	if _is_ci_commit "${_message}"; then
+		_log "CI commit detected (${_short_hash}) — skipping transcript parse"
+		return 0
+	fi
+
+	# locate transcript
+	local _transcript
+	_transcript="$(_latest_transcript)"
+
+	if [[ -z "${_transcript}" ]]; then
+		_log "no Claude session transcript found for this repo — skipping audit write"
+		return 0
+	fi
+
+	_log "transcript: ${_transcript}"
+
+	# get cutoff: timestamp of previous commit
+	local _since
+	_since="$(_prev_commit_timestamp)"
+	_log "extracting exchanges since: ${_since}"
+
+	# resolve session dir
+	local _session_dir _epoch
+	_session_dir="$(_session_dir)"
+	_epoch="$(basename "${_session_dir}" | sed 's/session-//')"
+
+	# parse transcript and write audit entries
+	_parse_transcript "${_transcript}" "${_since}" "${_session_dir}" "${_short_hash}"
+
+	# update index
+	_update_index "${_session_dir}" "${_epoch}" "${_author}" "${_branch}" "${_short_hash}"
+
+	_log "audit complete — session: ${_session_dir}"
+}
+
+main "$@"
