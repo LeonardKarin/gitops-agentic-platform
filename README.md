@@ -1,6 +1,6 @@
 # gitops-agentic-platform
 
-[![gitops-agentic-platform](https://img.shields.io/badge/gitops-agentic-platform-agentic-purple)]()
+[![gitops-agentic-platform](https://img.shields.io/badge/gitops_agentic-platform_agentic-purple)]()
 [![Claude Code](https://img.shields.io/badge/Claude-Code-blue)]()
 [![RGPD](https://img.shields.io/badge/RGPD-compliant-green)]()
 [![FedRAMP](https://img.shields.io/badge/FedRAMP-aligned-green)]()
